@@ -2,6 +2,9 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
+from torch import nn
+from torch.distributions import MultivariateNormal
+from torch.nn.functional import batch_norm
 
 
 class MZIMatrix(ABC):
@@ -96,23 +99,105 @@ class SimMZIMitrix(MZIMatrix):
         # todo
         ...
 
+
+# class RLEnv:
+#     def __init__(self):
+#         ...
+#     def step(self,act,x,y_target):
+#         self.mzi.update_voltage(act)
+#         y_theta=self.mzi.forward(x)
+#         obs=y_theta
+#         return obs
+
 class PPO:
-    def __init__(self,NN,act_space,obs_space,actor_lr,critic_lr,mzi):
+    def __init__(self, NN, act_space, obs_space, actor_lr, critic_lr, mzi):
         """
 
         :param act_space: tap to control [layer_num * parallel]
         :param obs_space: MZI inp and oup [parallel*2,] X cat Y_theta
         """
-        self.env=mzi
-        self.actor=NN(obs_space,act_space)
-        self.critic=NN(obs_space,1)
+        self.env = mzi  # mzi contains a random vector
+        self.env.initialize()
+        self.actor = NN(obs_space, act_space)
+        self.critic = NN(obs_space, 1)
 
-        self.actor_optimizer=torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
 
-
-
+        self.cov_var = torch.full((act_space,), 0.5, dtype=torch.float32)
+        self.cov_mat = torch.diag(self.cov_var)
         ...
+
+    def evaluate(self, batch_obs, batch_acts):
+        mean = self.actor(batch_obs)
+        dist = MultivariateNormal(mean, self.cov_mat)
+        log_probs = dist.log_prob(batch_acts)
+        return log_probs
+        ...  # todo
+
+    def get_action(self, batch_obs):
+        mean = self.actor(batch_obs)
+        dist = MultivariateNormal(mean, self.cov_mat)
+        action = dist.sample()
+        log_probs = dist.log_prob(action)
+        return log_probs
+
+    def calculate_Ak(self, episode_rewards):
+        batch_Ak = []
+        discounted_Ak = 0
+        for reward in episode_rewards:
+            discounted_Ak = reward + discounted_Ak * self.gamma
+            batch_Ak.insert(0, discounted_Ak)
+        batch_Ak = torch.tensor(batch_Ak, dtype=torch.float32)
+        return batch_Ak
+
+    def training_step(self, batch):
+        """FFM"""
+        x, y_target = batch  # x:[batch,parallel],y:[batch,parallel], random vector indicating true or false
+        batch_obs, batch_acts, batch_log_probs, A_k = self.rollout(x, y_target)
+
+        # log_probs=self.evaluate(batch_obs,batch_acts)
+        # A_k=(batch_rtgs-batch_rtgs.mean())/(batch_rtgs.std()+1e-10)
+
+        # Optional: A_k normalize `A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)`
+        for i in range(self.n_updates_per_batch):
+            curr_log_probs = self.evaluate(batch_obs, batch_acts)
+            ratios = torch.exp(curr_log_probs - batch_log_probs)
+
+            surr1 = ratios * A_k
+            surr2 = torch.clamp(ratios, 1 - self.epsilon, 1 + self.epsilon) * A_k
+
+            actor_loss = -torch.min(surr1, surr2).mean()
+
+            self.actor_optim.zero_grad()
+            actor_loss.backward(retain_graph=True)
+            self.actor_optim.step()
+            # todo: log
+
+    def rollout(self, x, y_target):
+        """以x，跑一个回合"""
+        episode_obs, episode_acts, episode_log_probs, episode_rtgs = [], [], [], []
+        episode_rewards = []
+        obs = self.env.forward(x)
+        for t in range(self.max_step_per_episode):
+            act, log_prob = self.get_action(obs)
+            self.env.update(act)
+            obs = self.env.farward(x)
+            reward = self.loss_fn(obs, y_target)
+
+            # Note! no terminated
+            episode_obs.append(obs)
+            episode_acts.append(act)
+            episode_rewards.append(reward)
+            episode_log_probs.append(log_prob)
+        episode_obs = torch.tensor(episode_obs, dtype=torch.float32)
+        episode_acts = torch.tensor(episode_acts, dtype=torch.float32)
+        episode_log_probs = torch.tensor(episode_log_probs, dtype=torch.float32)
+        A_k = self.compute_Ak(episode_rewards)
+
+        return episode_obs, episode_acts, episode_log_probs, A_k
+
+
 if __name__ == '__main__':
     symmetric_mzi_matrix(np.ones((6,)))
     matrix_mesh = mzi_mesh(np.ones((10, 8)))
