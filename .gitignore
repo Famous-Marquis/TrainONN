@@ -1,3 +1,10 @@
+# idea
+.idea/*
+# Project
+FFA/
+lightning_logs/
+mlruns/
+IrisDataset/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
