@@ -1,9 +1,11 @@
 import math
 from abc import ABC, abstractmethod
+from typing import Any
 
 import numpy as np
 import torch
 from lightning import LightningModule
+from lightning.pytorch.utilities.types import OptimizerLRScheduler, STEP_OUTPUT
 from torch import nn
 from torch.distributions import MultivariateNormal
 from torch.nn.functional import batch_norm
@@ -85,21 +87,21 @@ class SimMZIMitrix(MZIMatrix):
         self.global_phi = torch.tensor(self.global_phi, dtype=torch.float32).cuda() \
             if not isinstance(self.global_phi,torch.Tensor) \
             else self.global_phi.detach().clone().to(dtype=torch.float32).cuda()
-        self.nonlinear = torch.square
+        self.nonlinear = torch.nn.functional.sigmoid
         # todo obs输入非负，mzi后跟的nonlinear应该在非负区域非线性
         # model free 的non linear
         # assert shifter curve: phi=ax^2+bx+c (rad)
 
-    def step(self, x, y_target):
+    def step(self, x):
         y_theta = self.forward(x)
-        obs = torch.cat((x, y_target - y_theta), dim=0)
-        return obs, y_theta
+        # obs = torch.cat((x, y_target - y_theta), dim=0)
+        return y_theta
 
     def forward(self, x):
         """get amp and phase result"""
         x = x.to(dtype=torch.complex64)
-        detected = (x @ self.mesh_matrix)
-        return self.nonlinear(detected).float()
+        detected = (x @ self.mesh_matrix).abs().float()
+        return self.nonlinear(detected)
 
     def update_voltage(self, v_diff):
         """v: voltage, unit: Volt
@@ -110,9 +112,8 @@ class SimMZIMitrix(MZIMatrix):
         v_diff = v_diff.view(self.layer_num, self.parallel)
         assert len(v_diff.shape)==2,"v_diff shape wrong! Damn"
         updated_phase = (self.shifter_curve["a"] * v_diff ** 2
-                         + self.shifter_curve["b"] * v_diff
-                         + self.shifter_curve["c"])
-        self.global_phi = updated_phase + self.global_phi
+                         + self.shifter_curve["b"] * v_diff)
+        self.global_phi = updated_phase
         self.mesh_matrix = mzi_mesh(self.global_phi)
 
     def hardware_miss_alignment(self, eps):
@@ -152,125 +153,138 @@ class DNN(nn.Module):
         return self.model(x)
 
 
-class PPO(LightningModule):
-    def __init__(self, NN, batch, act_space, obs_space, actor_lr, critic_lr, mzi, epsilon,gamma=0.95,n_updates_per_batch=5):
-        """
+import torch
+import torch.nn as nn
+from lightning import LightningModule
+from torch.distributions import MultivariateNormal
 
-        :param act_space: tap to control [layer_num * parallel]
-        :param obs_space: MZI inp and oup [parallel*2,] X cat [Y_target - Y_theta]
-        """
+
+class PPOFixedMZI(LightningModule):
+    def __init__(self, M_samples, act_space, actor_lr, mzi, epsilon=0.2, n_updates_per_batch=5):
         super().__init__()
         self.automatic_optimization = False
         self.env = mzi
-        self.batch = batch
-        self.epsilon = epsilon
-        self.act_space = act_space
-        self.obs_space = obs_space
-        self.random_vector = ...  # a random vector
-        self.actor = NN(obs_space, act_space)
-        self.critic = NN(obs_space, 1)
-        self.actor_lr = actor_lr
-        self.critic_lr = critic_lr
-        self.gamma = gamma
-        self.n_updates_per_batch=n_updates_per_batch
-        # todo critic 输入包含y target吗？ 是的，x,y_target-y_theta
-        self.loss_fn = torch.nn.functional.mse_loss
-        self.max_step_per_episode = 100
 
-        self.cov_var = torch.full((act_space,), 0.10, dtype=torch.float32).cuda()
-        # todo cov_var 可变
-        self.cov_mat = torch.diag(self.cov_var)
-        self.save_hyperparameters(ignore=['NN', 'mzi'])
+        self.M_samples = M_samples  # 对应论文中的 M：每次采样多少组不同的 MZI 参数去试错
+        self.act_space = act_space
+        self.epsilon = epsilon
+        self.actor_lr = actor_lr
+        self.n_updates_per_batch = n_updates_per_batch
+
+        # 【关键改变1】：Actor 不再是神经网络，而是直接的物理参数分布的均值 (mu)
+        # 初始化为你猜测的一组电压，或者全 0
+        self.mu = nn.Parameter(torch.zeros(act_space, dtype=torch.float32))
+
+        # 设定一个固定的方差 (论文中设定为 0.04) 或者也可以设为可学习的 Parameter
+        cov_var = torch.full((act_space,), 0.04, dtype=torch.float32)
+        self.register_buffer('cov_mat', torch.diag(cov_var))
+
+        self.loss_fn = torch.nn.functional.cross_entropy
 
     def configure_optimizers(self):
-        # 2. 在这里配置优化器，Lightning 会自动接管它们（包括混合精度、设备转移等）
-        actor_optim = torch.optim.Adam(self.actor.parameters(), lr=self.actor_lr)
-        critic_optim = torch.optim.Adam(self.critic.parameters(), lr=self.critic_lr)
-        # 返回列表
-        return actor_optim, critic_optim
+        # 优化器现在只优化 mu 这一个张量
+        actor_optim = torch.optim.Adam([self.mu], lr=self.actor_lr)
+        return actor_optim
 
-    def evaluate(self, episode_obs, episode_acts):
-        V = self.critic(episode_obs)
-        mean = self.actor(episode_obs)
-        dist = MultivariateNormal(mean, self.cov_mat)
-        log_probs = dist.log_prob(episode_acts)
-        return V, log_probs
+    def get_action_and_logprob(self, action=None):
+        # 构建正态分布 N(mu, sigma^2)
+        dist = MultivariateNormal(self.mu, self.cov_mat)
+        if action is None:
+            # 采样
+            action = dist.sample()
+        # 计算 log_prob
+        log_prob = dist.log_prob(action)
+        return action, log_prob
+    def validation_step(self,batch_data, batch_idx):
+        x_batch, y_target_batch = batch_data
+        y_theta_batch = self.env.step(x_batch)
+        y_theta_batch=torch.argmax(y_theta_batch, dim=1)
+        batch_acc=torch.sum(y_theta_batch==y_target_batch)/y_target_batch.size(0)
+        self.log("val_acc", batch_acc.item(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+    def training_step(self, batch_data):
+        # batch_data: 包含了一批输入信号 X 和对应的 Y_target [batch_size, parallel]
+        x_batch, y_target_batch = batch_data
+        actor_optim = self.optimizers()
 
-    def get_action(self, batch_obs):
-        mean = self.actor(batch_obs)
-        dist = MultivariateNormal(mean, self.cov_mat)
-        batch_action = dist.sample()
-        log_probs = dist.log_prob(batch_action)
-        return batch_action.detach(), log_probs.detach()
+        # 1. 采样 M 组不同的 MZI 动作 (对应论文 Step 1)
+        # shape: [M_samples, act_space]
+        sampled_actions = torch.zeros((self.M_samples, self.act_space), device=self.device)
+        old_log_probs = torch.zeros(self.M_samples, device=self.device)
+        rewards = torch.zeros(self.M_samples, device=self.device)
 
-    def calculate_rwtg(self, episode_rewards, normalized=False):
-        """:return discounted_rwtg [episode,]"""
-        T = len(episode_rewards)
-        rwtg = torch.zeros_like(episode_rewards)
-
-        running_add = torch.zeros_like(episode_rewards[0])
-        for t in reversed(range(T)):
-            running_add = episode_rewards[t] + self.gamma * running_add
-            rwtg[t] = running_add
-        return rwtg
-
-    def training_step(self, single_data_pair):
-        """FFM"""
-        actor_optim, critic_optim = self.optimizers()
-        x, y_target = single_data_pair  # x:[parallel],y:[parallel], random vector indicating true or false
         with torch.no_grad():
-            episode_obs, episode_acts, episode_log_probs, episode_rwtg = self.rollout(x, y_target)
-            """shape: [steps_per_episode,batch,(parallel)]"""
-            V, _ = self.evaluate(episode_obs, episode_acts, )
-            # A_k=(batch_rtgs-batch_rtgs.mean())/(batch_rtgs.std()+1e-10)
-            episode_A_k = episode_rwtg - V.detach().squeeze(-1)
-            episode_A_k = (episode_A_k - episode_A_k.mean()) / (episode_A_k.std() + 1e-10)
-            # Optional: A_k normalize `A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)`
-        for i in range(self.n_updates_per_batch):
-            V, curr_log_probs = self.evaluate(episode_obs, episode_acts)
-            ratios = torch.exp(curr_log_probs - episode_log_probs)
+            for i in range(self.M_samples):
+                action, log_prob = self.get_action_and_logprob()
+                sampled_actions[i] = action
+                old_log_probs[i] = log_prob
 
-            surr1 = ratios * episode_A_k
-            surr2 = torch.clamp(ratios, 1 - self.epsilon, 1 + self.epsilon) * episode_A_k
+                # 2. 物理评估 (对应论文 Step 2)
+                # 将采样到的这组 action（电压）写入 MZI
+                self.env.update_voltage(action)
 
+                # 用这*一组*物理参数，跑完*一整批*的数据 X，得到输出
+                y_theta_batch = self.env.step(x_batch)
+                # y_theta_batch = torch.argmax(y_theta_batch, dim=1)
+
+                # 3. 计算这一组参数在这批数据上的总表现 (对应论文 Step 3)
+                # reward 是一个标量
+                reward = -self.loss_fn(y_theta_batch, y_target_batch)
+                rewards[i] = reward
+
+            # 计算优势函数 Advantage
+            # 因为没有序列决策（没有时间步），所以不需要计算 rwtg 和 Critic 网络，直接用 Reward 标准化即可
+            # A_k = (R - R_mean) / (R_std + 1e-10)
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-10)
+
+        # 4. PPO 数字策略更新 (对应论文 Step 4)
+        for _ in range(self.n_updates_per_batch):
+            # 重新计算当前 mu 下，那些 sampled_actions 的概率
+            _, curr_log_probs = self.get_action_and_logprob(sampled_actions)
+
+            ratios = torch.exp(curr_log_probs - old_log_probs)
+
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.epsilon, 1 + self.epsilon) * advantages
+
+            # 我们要最大化 reward，所以 loss 加负号
             actor_loss = -torch.min(surr1, surr2).mean()
-            critic_loss = torch.nn.functional.mse_loss(V.squeeze(), episode_rwtg)
-            assert len(actor_loss.shape) == 0, "loss is not scalar"
 
             actor_optim.zero_grad()
             actor_loss.backward()
             actor_optim.step()
 
-            critic_optim.zero_grad()
-            critic_loss.backward()
-            critic_optim.step()
-            # todo: log
-            self.log("train_actor_loss", actor_loss.item(), prog_bar=True)
-            self.log("train_critic_loss", critic_loss.item(), prog_bar=True)
+        self.log("train_actor_loss", actor_loss.item(), prog_bar=True)
+        self.log("batch_mean_reward", rewards.mean().item(), prog_bar=True)
 
-    def rollout(self, x, y_target):
-        """以x，跑一个回合"""
-        episode_obs = torch.zeros((self.max_step_per_episode, self.obs_space), dtype=torch.float32).cuda()
-        episode_acts = torch.zeros((self.max_step_per_episode, self.act_space), dtype=torch.float32).cuda()
-        episode_log_probs = torch.zeros((self.max_step_per_episode,), dtype=torch.float32).cuda()
-        episode_rewards = torch.zeros((self.max_step_per_episode,), dtype=torch.float32).cuda()
-        obs, _ = self.env.step(x, y_target)
-        for t in range(self.max_step_per_episode):
-            act, log_prob = self.get_action(obs)
-            self.env.update_voltage(act)
-            obs, y_theta = self.env.step(x,y_target)
-            reward = -self.loss_fn(y_theta, y_target)
 
-            # Note! no terminated
-            episode_obs[t] = obs
-            episode_acts[t] = act
-            episode_rewards[t] = reward
-            episode_log_probs[t] = log_prob
-        rwtg = self.calculate_rwtg(episode_rewards).cuda()
+# 模型1：你的方案（8x8 + ReLU）
+class SimpleModel(LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(8, 8, bias=False)  # 8x8矩阵
+        self.activation = nn.ReLU()
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        return optimizer
+    def validation_step(self, batch_data):
+        x_batch, y_target_batch = batch_data
+        y_theta_batch = self.forward(x_batch)
+        y_theta_batch = torch.argmax(y_theta_batch, dim=1)
+        batch_acc = torch.sum(y_theta_batch==y_target_batch)/y_target_batch.size(0)
+        self.log("val_acc", batch_acc.item(), on_step=False, on_epoch=True, prog_bar=True)
 
-        return episode_obs, episode_acts, episode_log_probs, rwtg
-        # todo 用register_buffer 注册不需要求梯度的常量
-        # todo 各个代码中，不要将cuda写死，用self device
+
+    def training_step(self, batch_data):
+        x_batch, y_target_batch = batch_data
+        y_theta_batch = self.forward(x_batch)
+        loss = torch.nn.functional.cross_entropy(y_theta_batch, y_target_batch)
+        self.log("train_loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return loss
+
+
+    def forward(self, x):
+        return self.activation(self.linear(x))
+
 
 if __name__ == '__main__':
     symmetric_mzi_matrix(np.ones((6,)))
