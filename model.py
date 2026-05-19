@@ -1,5 +1,6 @@
 import math
 from abc import ABC, abstractmethod
+import torch.functional as F
 from typing import Any
 
 import numpy as np
@@ -7,7 +8,7 @@ import torch
 from lightning import LightningModule
 from lightning.pytorch.utilities.types import OptimizerLRScheduler, STEP_OUTPUT
 from torch import nn
-from torch.distributions import MultivariateNormal
+from torch.distributions import MultivariateNormal, Normal
 from torch.nn.functional import batch_norm
 
 
@@ -42,30 +43,35 @@ class OptimizerAgent(ABC):
 
 def symmetric_mzi_matrix(phs_layer):
     assert phs_layer.shape[0] % 2 == 0, "phs_layer must be even"
-    matrix_layer = torch.tensor((), dtype=torch.complex64).cuda()  # init null layer matrix
+    device = phs_layer.device  # 【关键1】：从输入的 phase layer 推断 device，不写死 cuda
+
+    matrices = []
+    # 【优化】：预先计算好常数矩阵，避免在循环中重复创建
+    mat1 = (math.sqrt(2) / 2) * torch.ones((2, 2), dtype=torch.complex64, device=device)
+    mat2 = torch.diag(-1j * torch.ones((2,), dtype=torch.complex64, device=device))
+    base_mat = mat1 @ mat2
+
     for i in range(phs_layer.shape[0] // 2):
-        # matrix = (torch.tensor([[torch.exp(1j * phs_layer[2 * i]), 0],
-        #                         [0, torch.exp(1j * phs_layer[2 * i + 1])]], dtype=torch.complex64)
-        #           @ torch.tensor([[np.sqrt(2) / 2, np.sqrt(2) / 2 * 1j],
-        #                           [np.sqrt(2) / 2 * 1j, np.sqrt(2) / 2], ], dtype=torch.complex64))
-        matrix = (math.sqrt(2) / 2 * torch.ones((2, 2), dtype=torch.complex64, device='cuda')
-                  @ torch.diag(-1j * torch.ones((2,), dtype=torch.complex64, device='cuda'))
-                  @ torch.diag(torch.exp(1j * phs_layer[2 * i:2 * i + 2])))
-        matrix_layer = torch.block_diag(matrix_layer, matrix)
-    matrix_layer = matrix_layer[1:]  # delete init null matrix
-    # print(matrix_layer)
+        mat3 = torch.diag(torch.exp(1j * phs_layer[2 * i: 2 * i + 2]))
+        matrix = base_mat @ mat3
+        matrices.append(matrix)
+
+    # 【优化】：将列表解包一次性构建块对角矩阵，比循环里拼接更快
+    matrix_layer = torch.block_diag(*matrices)
     return matrix_layer
 
 
 def mzi_mesh(global_phi, parallel=8):
-    matrix_mesh = torch.diag(torch.ones(parallel, dtype=torch.complex64, device='cuda'))
+    device = global_phi.device  # 【关键1】
+    matrix_mesh = torch.eye(parallel, dtype=torch.complex64, device=device)
+
     for lay_idx in range(global_phi.shape[0]):
         layer_phi = global_phi[lay_idx]
         if lay_idx in [2, 4, 6, 8]:
             matrix_layer = symmetric_mzi_matrix(layer_phi[1:-1])
-            matrix_layer = torch.block_diag(torch.ones((1,), dtype=torch.complex64, device='cuda'),
-                                            matrix_layer,
-                                            torch.ones((1,), dtype=torch.complex64, device='cuda'))
+            # padding 两端用 [1]
+            padding = torch.ones((1,), dtype=torch.complex64, device=device)
+            matrix_layer = torch.block_diag(padding, matrix_layer, padding)
             matrix_mesh = matrix_mesh @ matrix_layer
         else:
             matrix_layer = symmetric_mzi_matrix(layer_phi)
@@ -73,62 +79,51 @@ def mzi_mesh(global_phi, parallel=8):
     return matrix_mesh
 
 
-class SimMZIMitrix(MZIMatrix):
+class SimMZIMitrix(torch.nn.Module):  # 假设你继承自 nn.Module
     def __init__(self, layer_num, parallel):
         super().__init__()
         self.layer_num = layer_num
         self.parallel = parallel
-        self.global_phi = torch.randn((layer_num, parallel),
-                                      dtype=torch.float32).cuda()  # [layer,parallel], random init
+
+        # 【关键2】：使用 register_buffer。这些张量会保存在模块的状态字典中，
+        # 且调用 self.cuda() 或 self.to(device) 时，它们会自动转移到对应设备。
+        self.register_buffer("global_phi", torch.randn((layer_num, parallel), dtype=torch.float32))
+
+        # 将字典拆解为 buffer，原代码的 update 里面漏加了 c，我在这里修复了
+        self.register_buffer("shifter_a", torch.zeros((layer_num, parallel), dtype=torch.float32))
+        self.register_buffer("shifter_b", torch.ones((layer_num, parallel), dtype=torch.float32))
+        self.register_buffer("shifter_c", torch.randn((layer_num, parallel), dtype=torch.float32))
+
+        # 初始矩阵，不需要 registered，可以在 forward 中动态确保它在正确设备上
         self.mesh_matrix = mzi_mesh(self.global_phi)
-        self.shifter_curve = {"a": torch.randn((layer_num, parallel), dtype=torch.float32).cuda() * 0,
-                              "b": torch.ones((layer_num, parallel), dtype=torch.float32).cuda(),
-                              "c": torch.randn((layer_num, parallel), dtype=torch.float32).cuda()}
-        self.global_phi = torch.tensor(self.global_phi, dtype=torch.float32).cuda() \
-            if not isinstance(self.global_phi,torch.Tensor) \
-            else self.global_phi.detach().clone().to(dtype=torch.float32).cuda()
-        self.nonlinear = torch.nn.functional.sigmoid
-        # todo obs输入非负，mzi后跟的nonlinear应该在非负区域非线性
-        # model free 的non linear
-        # assert shifter curve: phi=ax^2+bx+c (rad)
+        self.nonlinear = nn.Identity()# F.sigmoid
 
     def step(self, x):
-        y_theta = self.forward(x)
-        # obs = torch.cat((x, y_target - y_theta), dim=0)
-        return y_theta
+        return self.forward(x)
 
     def forward(self, x):
         """get amp and phase result"""
         x = x.to(dtype=torch.complex64)
-        detected = (x @ self.mesh_matrix).abs().float()
+
+        # 确保计算图中的 mesh_matrix 和输入 x 在同一个 device 上
+        if self.mesh_matrix.device != x.device:
+            self.mesh_matrix = self.mesh_matrix.to(x.device)
+
+        detected = (x @ self.mesh_matrix).abs().square().float()
         return self.nonlinear(detected)
 
     def update_voltage(self, v_diff):
-        """v: voltage, unit: Volt
-            v has no limit
-        """
-
-
         v_diff = v_diff.view(self.layer_num, self.parallel)
-        assert len(v_diff.shape)==2,"v_diff shape wrong! Damn"
-        updated_phase = (self.shifter_curve["a"] * v_diff ** 2
-                         + self.shifter_curve["b"] * v_diff)
-        self.global_phi = updated_phase
+        assert len(v_diff.shape) == 2, "v_diff shape wrong! Damn"
+
+        # 因为全都是 buffer，它们天然就在同一个 device 上
+        updated_phase = (self.shifter_a * v_diff ** 2 +
+                         self.shifter_b * v_diff +
+                         self.shifter_c)  # 补充了 + self.shifter_c
+
+        # 覆盖 global_phi，使用无梯度 in-place 更新
+        self.global_phi.copy_(updated_phase)
         self.mesh_matrix = mzi_mesh(self.global_phi)
-
-    def hardware_miss_alignment(self, eps):
-        # todo
-        return None
-
-    def temperature_shift(self, T):
-        # todo
-        return None
-
-    def power_loss(self, power_loss):
-        # todo
-        ...
-
-
 # class RLEnv:
 #     def __init__(self):
 #         ...
@@ -137,6 +132,98 @@ class SimMZIMitrix(MZIMatrix):
 #         y_theta=self.mzi.forward(x)
 #         obs=y_theta
 #         return obs
+class TiledMZIMatrix(nn.Module):
+    def __init__(self, in_features, out_features, layer_num, parallel=8, device="cuda:0"):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.layer_num = layer_num
+        self.parallel = parallel
+
+        self.in_blocks = math.ceil(in_features / parallel)
+        self.out_blocks = math.ceil(out_features / parallel)
+
+        self.pad_in = self.in_blocks * parallel - in_features
+        self.pad_out = self.out_blocks * parallel - out_features
+
+        param_shape = (self.in_blocks, self.out_blocks, layer_num, parallel)
+        mzi_property_shape = (layer_num, parallel)
+
+        # 1. 注册基础物理参数 buffer
+        self.register_buffer("global_phi", torch.randn(param_shape, dtype=torch.float32))
+        self.register_buffer("shifter_a", torch.zeros(mzi_property_shape, dtype=torch.float32))
+        self.register_buffer("shifter_b", torch.ones(mzi_property_shape, dtype=torch.float32))
+        self.register_buffer("shifter_c", torch.randn(mzi_property_shape, dtype=torch.float32))
+
+        # 【修复1】：将 mesh_matrices 也注册为 buffer！让它归 PyTorch 管。
+        mesh_shape = (self.in_blocks, self.out_blocks, self.parallel, self.parallel)
+        self.register_buffer("mesh_matrices", torch.zeros(mesh_shape, dtype=torch.complex64))
+
+        self.nonlinear = lambda x: x  # F.sigmoid
+
+        # 初始化动作 (注意：此时依然在 CPU 上，等会会被 .to 转移)
+        initial_action = torch.zeros(math.prod(param_shape), dtype=torch.float32)
+        self.update_voltage(initial_action)
+
+    def update_voltage(self, v_diff):
+        """
+        接收 PPO 给出的扁平化 action 向量，并更新所有的 8x8 MZI tile
+        """
+        # 【修复2】：强制将外部传进来的 v_diff 转换到模型所在的设备上！
+        # 这一步极其重要，防止 PPO 传个 CPU 向量进来导致设备冲突。
+        v_diff = v_diff.to(self.shifter_a.device)
+
+        v_diff = v_diff.view(self.in_blocks, self.out_blocks, self.layer_num, self.parallel)
+
+        updated_phase = (self.shifter_a * v_diff ** 2 +
+                         self.shifter_b * v_diff +
+                         self.shifter_c)
+        self.global_phi.copy_(updated_phase)
+
+        # 【修复3】：使用模型自己的 device 作为基准
+        device = self.global_phi.device
+        matrices = torch.zeros((self.in_blocks, self.out_blocks, self.parallel, self.parallel),
+                               dtype=torch.complex64, device=device)
+
+        for i in range(self.in_blocks):
+            for j in range(self.out_blocks):
+                # 【注意】：确保你写的 mzi_mesh 函数内部的张量也生成在了正确的 device 上！
+                matrices[i, j] = mzi_mesh(self.global_phi[i, j], parallel=self.parallel)
+
+        # 【修复4】：必须用 .copy_() 原地更新 buffer！绝对不能用 = 直接赋值！
+        # 如果你写 self.mesh_matrices = matrices，刚刚注册的 buffer 追踪就断了。
+        self.mesh_matrices.copy_(matrices)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+
+        if self.pad_in > 0:
+            x = F.pad(x, (0, self.pad_in))
+
+        x = x.to(dtype=torch.complex64)
+        x_blocks = x.view(batch_size, self.in_blocks, self.parallel)
+
+        out_blocks = torch.zeros((batch_size, self.out_blocks, self.parallel),
+                                 dtype=torch.float32, device=x.device)
+
+        for i in range(self.in_blocks):
+            for j in range(self.out_blocks):
+                mesh_ij = self.mesh_matrices[i, j]
+                # 此时 x_blocks 和 mesh_ij 都在同一个 device (比如 GPU) 上，丝滑运算
+                block_detected = (x_blocks[:, i, :] @ mesh_ij)
+                block_detected = (block_detected.real.square() + block_detected.imag.square()).float()
+                out_blocks[:, j, :] += block_detected
+
+        out_flat = out_blocks.view(batch_size, -1)
+
+        if self.pad_out > 0:
+            out_flat = out_flat[:, :self.out_features]
+
+        detected = out_flat.float()
+        return self.nonlinear(detected)
+
+    def step(self, x):
+        return self.forward(x)
 
 class DNN(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -175,9 +262,10 @@ class PPOFixedMZI(LightningModule):
         # 初始化为你猜测的一组电压，或者全 0
         self.mu = nn.Parameter(torch.zeros(act_space, dtype=torch.float32))
 
-        # 设定一个固定的方差 (论文中设定为 0.04) 或者也可以设为可学习的 Parameter
-        cov_var = torch.full((act_space,), 0.04, dtype=torch.float32)
-        self.register_buffer('cov_mat', torch.diag(cov_var))
+        # 【核心优化】：不再注册全零的协方差矩阵矩阵！
+        # 论文方差是 0.04，标准差就是 sqrt(0.04) = 0.2
+        # 我们只保留一个一维的标准差向量（内存占用从 1.5TB 降到几 KB）
+        self.register_buffer('sigma', torch.full((act_space,), 0.2, dtype=torch.float32))
 
         self.loss_fn = torch.nn.functional.cross_entropy
 
@@ -187,16 +275,24 @@ class PPOFixedMZI(LightningModule):
         return actor_optim
 
     def get_action_and_logprob(self, action=None):
-        # 构建正态分布 N(mu, sigma^2)
-        dist = MultivariateNormal(self.mu, self.cov_mat)
+        # 【核心优化】：使用标准 Normal 分布代替复杂的 MultivariateNormal
+        dist = Normal(self.mu, self.sigma)
+
         if action is None:
-            # 采样
             action = dist.sample()
-        # 计算 log_prob
-        log_prob = dist.log_prob(action)
+
+        # 【核心点】：各个物理参数是独立的，多元正态分布的对数概率
+        # 等于每个独立一元正态分布对数概率的总和。
+        # 如果 action 是单样本 [act_space]，则 sum(-1) 变成标量
+        # 如果 action 是批次 [M_samples, act_space]，则 sum(-1) 变成 [M_samples]
+        log_prob = dist.log_prob(action).sum(dim=-1)
+
         return action, log_prob
     def validation_step(self,batch_data, batch_idx):
         x_batch, y_target_batch = batch_data
+        x_batch,y_target_batch=x_batch.cuda(),y_target_batch.cuda()
+        # 【关键修复】：将图像 [batch_size, 1, 28, 28] 展平为 [batch_size, 784]
+        x_batch = x_batch.view(x_batch.size(0), -1)
         y_theta_batch = self.env.step(x_batch)
         y_theta_batch=torch.argmax(y_theta_batch, dim=1)
         batch_acc=torch.sum(y_theta_batch==y_target_batch)/y_target_batch.size(0)
@@ -204,6 +300,9 @@ class PPOFixedMZI(LightningModule):
     def training_step(self, batch_data):
         # batch_data: 包含了一批输入信号 X 和对应的 Y_target [batch_size, parallel]
         x_batch, y_target_batch = batch_data
+        x_batch,y_target_batch=x_batch.cuda(),y_target_batch.cuda()
+        # 【关键修复】：将图像展平为 [batch_size, 784]
+        x_batch = x_batch.view(x_batch.size(0), -1)
         actor_optim = self.optimizers()
 
         # 1. 采样 M 组不同的 MZI 动作 (对应论文 Step 1)
@@ -241,7 +340,12 @@ class PPOFixedMZI(LightningModule):
             # 重新计算当前 mu 下，那些 sampled_actions 的概率
             _, curr_log_probs = self.get_action_and_logprob(sampled_actions)
 
-            ratios = torch.exp(curr_log_probs - old_log_probs)
+            # ✅ 工业级安全的防爆写法
+            log_ratio = curr_log_probs - old_log_probs
+
+            # 将对数差值限制在 [-20, 20] 之间。
+            # torch.exp(20) 约为 4.8x10^8，足够策略进行剧烈优化，但绝对不会变成 inf 导致硬件溢出
+            ratios = torch.exp(torch.clamp(log_ratio, min=-20.0, max=20.0))
 
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.epsilon, 1 + self.epsilon) * advantages
