@@ -1,15 +1,15 @@
 import math
 from abc import ABC, abstractmethod
-import torch.functional as F
+import torch.nn.functional as F
 from typing import Any
-
+from torch.func import vmap
 import numpy as np
 import torch
 from lightning import LightningModule
 from lightning.pytorch.utilities.types import OptimizerLRScheduler, STEP_OUTPUT
 from torch import nn
 from torch.distributions import MultivariateNormal, Normal
-from torch.nn.functional import batch_norm
+from torch.nn.functional import batch_norm, sigmoid
 
 
 class MZIMatrix(ABC):
@@ -159,20 +159,16 @@ class TiledMZIMatrix(nn.Module):
         mesh_shape = (self.in_blocks, self.out_blocks, self.parallel, self.parallel)
         self.register_buffer("mesh_matrices", torch.zeros(mesh_shape, dtype=torch.complex64))
 
-        self.nonlinear = lambda x: x  # F.sigmoid
+        self.nonlinear = lambda x: x #sigmoid
 
         # 初始化动作 (注意：此时依然在 CPU 上，等会会被 .to 转移)
         initial_action = torch.zeros(math.prod(param_shape), dtype=torch.float32)
         self.update_voltage(initial_action)
 
-    def update_voltage(self, v_diff):
-        """
-        接收 PPO 给出的扁平化 action 向量，并更新所有的 8x8 MZI tile
-        """
-        # 【修复2】：强制将外部传进来的 v_diff 转换到模型所在的设备上！
-        # 这一步极其重要，防止 PPO 传个 CPU 向量进来导致设备冲突。
-        v_diff = v_diff.to(self.shifter_a.device)
 
+
+    def update_voltage(self, v_diff):
+        v_diff = v_diff.to(self.shifter_a.device)
         v_diff = v_diff.view(self.in_blocks, self.out_blocks, self.layer_num, self.parallel)
 
         updated_phase = (self.shifter_a * v_diff ** 2 +
@@ -180,18 +176,18 @@ class TiledMZIMatrix(nn.Module):
                          self.shifter_c)
         self.global_phi.copy_(updated_phase)
 
-        # 【修复3】：使用模型自己的 device 作为基准
-        device = self.global_phi.device
-        matrices = torch.zeros((self.in_blocks, self.out_blocks, self.parallel, self.parallel),
-                               dtype=torch.complex64, device=device)
+        # 【核心优化】：将 in_blocks 和 out_blocks 合并为一个批次维度
+        phi_flat = self.global_phi.view(self.in_blocks * self.out_blocks, self.layer_num, self.parallel)
 
-        for i in range(self.in_blocks):
-            for j in range(self.out_blocks):
-                # 【注意】：确保你写的 mzi_mesh 函数内部的张量也生成在了正确的 device 上！
-                matrices[i, j] = mzi_mesh(self.global_phi[i, j], parallel=self.parallel)
+        # 使用 vmap 将针对单个 tile 的 mzi_mesh 转化为支持 batch 的函数
+        # in_dims=0 表示沿着 phi_flat 的第 0 维度（即 tile_batch 维）并行计算
+        batched_mzi_mesh = vmap(mzi_mesh, in_dims=0)
 
-        # 【修复4】：必须用 .copy_() 原地更新 buffer！绝对不能用 = 直接赋值！
-        # 如果你写 self.mesh_matrices = matrices，刚刚注册的 buffer 追踪就断了。
+        # 一次性算出所有的 8x8 矩阵！
+        matrices_flat = batched_mzi_mesh(phi_flat)
+
+        # 重新 reshape 回 4D 张量并安全更新 buffer
+        matrices = matrices_flat.view(self.in_blocks, self.out_blocks, self.parallel, self.parallel)
         self.mesh_matrices.copy_(matrices)
 
     def forward(self, x):
@@ -203,24 +199,25 @@ class TiledMZIMatrix(nn.Module):
         x = x.to(dtype=torch.complex64)
         x_blocks = x.view(batch_size, self.in_blocks, self.parallel)
 
-        out_blocks = torch.zeros((batch_size, self.out_blocks, self.parallel),
-                                 dtype=torch.float32, device=x.device)
+        # 【核心优化】：使用 einsum 替代双重 for 循环！
+        # b: batch, i: in_blocks, p: parallel (input)
+        # j: out_blocks, q: parallel (output)
+        # 计算结果 out_complex 的形状为: [batch_size, in_blocks, out_blocks, parallel]
+        out_complex = torch.einsum('bip, ijpq -> bijq', x_blocks, self.mesh_matrices)
 
-        for i in range(self.in_blocks):
-            for j in range(self.out_blocks):
-                mesh_ij = self.mesh_matrices[i, j]
-                # 此时 x_blocks 和 mesh_ij 都在同一个 device (比如 GPU) 上，丝滑运算
-                block_detected = (x_blocks[:, i, :] @ mesh_ij)
-                block_detected = (block_detected.real.square() + block_detected.imag.square()).float()
-                out_blocks[:, j, :] += block_detected
+        # 分别求实部和虚部的平方和，得到光强
+        out_mag = out_complex.real.square() + out_complex.imag.square()
+
+        # 在 in_blocks 维度 (dim=1) 上进行非相干累加
+        # 结果形状变为: [batch_size, out_blocks, parallel]
+        out_blocks = out_mag.sum(dim=1)
 
         out_flat = out_blocks.view(batch_size, -1)
 
         if self.pad_out > 0:
             out_flat = out_flat[:, :self.out_features]
 
-        detected = out_flat.float()
-        return self.nonlinear(detected)
+        return self.nonlinear(out_flat.float())
 
     def step(self, x):
         return self.forward(x)

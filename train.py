@@ -36,20 +36,24 @@ if __name__ == '__main__':
 
     logger=MLFlowLogger(tracking_uri='file:./mlruns',
                         experiment_name = "PPOFixedMZI",
-                        run_name="CE 直给; tiled; mnist"
+                        run_name="CE 直给; tiled; mnist; "
     )
     train_loader=DataLoader(MNIST(root='FFA/data',download=True,train=True,transform=torchvision.transforms.ToTensor()),
-                            batch_size=64,shuffle=True,num_workers=4)
+                            batch_size=256,shuffle=True,num_workers=4)
     val_loader=DataLoader(MNIST(root='FFA/data',download=True,train=False,transform=torchvision.transforms.ToTensor()),
-                            batch_size=64,shuffle=False)
+                            batch_size=256,shuffle=False)
     # 2. 【核心修改】：设定你想让每个 Epoch 跑多少条数据
     train_samples = 1280  # 比如只抽 1280 条（64 batch_size 下对应 20 个 step）
     val_samples = 256  # 验证集只抽 256 条
 
     # 使用 Subset 截取前 N 个样本
-    # subset_train_dataset = Subset(full_train_dataset, range(train_samples))
-    # subset_val_dataset = Subset(full_val_dataset, range(val_samples))
-    trainer=Trainer(max_epochs=200,logger=logger,check_val_every_n_epoch=1,profiler="pytorch")
+    subset_train_dataset = Subset(MNIST(root='FFA/data',download=True,train=True,transform=torchvision.transforms.ToTensor()), range(train_samples))
+    subset_val_dataset = Subset(MNIST(root='FFA/data',download=True,train=False,transform=torchvision.transforms.ToTensor()), range(val_samples))
+
+    sub_train_loader = DataLoader(subset_train_dataset,batch_size=64,shuffle=True,num_workers=4)
+    sub_val_loader = DataLoader(subset_val_dataset,batch_size=64,shuffle=False)
+
+    trainer=Trainer(max_epochs=20,logger=logger,check_val_every_n_epoch=1,profiler="pytorch")
     # N = 40960
     # size = 8
     # X,y=get_simple_data(n_samples=N, n_features=size)
@@ -69,5 +73,5 @@ if __name__ == '__main__':
     ppo_agent = PPOFixedMZI(M_samples=16, act_space=correct_act_space ,  actor_lr=1e-2, mzi=tiled_mzi,
                     epsilon=0.2).cuda()
     simple_nn=SimpleModel()
-    trainer.fit(ppo_agent, train_loader,val_loader)
+    trainer.fit(ppo_agent, train_loader,val_loader,)
 
